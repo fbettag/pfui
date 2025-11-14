@@ -1,0 +1,17 @@
+# Example pfui configuration.
+
+# The models whitelist lets administrators restrict which entries appear when
+# users run /model. Uncomment the block below and list allowed model IDs.
+#
+# [models]
+# whitelist = [
+#   "gpt-4.1-mini",
+#   "claude-3-5-sonnet",
+# ]
+
+# Provider toggles (enable/disable built-in providers)
+# [providers.openai]
+# enabled = true
+#
+# [providers.anthropic]
+# enabled = true
