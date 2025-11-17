@@ -13,6 +13,7 @@ type commandPalette struct {
 	commands         []string
 	filteredCommands []string
 	SelectedCommand  string
+	selection        int
 }
 
 var defaultCommands = []string{
@@ -40,6 +41,7 @@ func newCommandPalette() commandPalette {
 	return commandPalette{
 		commands:         cmds,
 		filteredCommands: append([]string(nil), cmds...),
+		selection:        -1,
 	}
 }
 
@@ -47,6 +49,7 @@ func (p *commandPalette) activate() {
 	p.visible = true
 	p.filter = ""
 	p.filteredCommands = append([]string(nil), p.commands...)
+	p.selection = -1
 }
 
 func (p *commandPalette) UpdateKey(msg tea.KeyMsg) (bool, tea.Cmd) {
@@ -77,6 +80,7 @@ func (p *commandPalette) Reset() {
 	p.filter = ""
 	p.filteredCommands = append([]string(nil), p.commands...)
 	p.SelectedCommand = ""
+	p.selection = -1
 }
 
 func (p *commandPalette) View() string {
@@ -97,10 +101,12 @@ func (p *commandPalette) View() string {
 
 func (p *commandPalette) setFilter(filter string) {
 	p.filter = filter
+	p.SelectedCommand = ""
 	p.filteredCommands = p.filterCommands(filter)
-	if strings.TrimSpace(filter) != "" && len(p.filteredCommands) == 1 {
-		p.SelectedCommand = p.filteredCommands[0]
-		p.visible = false
+	if len(p.filteredCommands) == 0 {
+		p.selection = -1
+	} else if p.selection >= len(p.filteredCommands) || p.selection < 0 {
+		p.selection = 0
 	}
 }
 
@@ -116,4 +122,27 @@ func (p *commandPalette) filterCommands(filter string) []string {
 		}
 	}
 	return filtered
+}
+
+func (p *commandPalette) cycleSelection(delta int) string {
+	count := len(p.filteredCommands)
+	if count == 0 {
+		p.selection = -1
+		return ""
+	}
+	if p.selection < 0 {
+		if delta >= 0 {
+			p.selection = 0
+		} else {
+			p.selection = count - 1
+		}
+	} else {
+		p.selection += delta
+		if p.selection >= count {
+			p.selection = 0
+		} else if p.selection < 0 {
+			p.selection = count - 1
+		}
+	}
+	return p.filteredCommands[p.selection]
 }

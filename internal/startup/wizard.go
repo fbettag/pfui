@@ -3,6 +3,7 @@ package startup
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,7 +84,9 @@ type wizardModel struct {
 	mode             wizardMode
 	input            textinput.Model
 	current          *wizardCard
-	pendingAnthropic *authflow.AnthropicAuthorize
+	pendingAnthropic *authflow.BrowserSession[authflow.AnthropicResult]
+	pendingOpenAI    *authflow.BrowserSession[string]
+	manualProvider   string
 	authStatus       map[cardKind]bool
 	cfg              config.Config
 	cfgPath          string
@@ -157,6 +160,10 @@ func (m wizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	case openaiAuthMsg:
+		m.pendingOpenAI = nil
+		if m.manualProvider == "openai" {
+			m.manualProvider = ""
+		}
 		if msg.err != nil {
 			m.message = fmt.Sprintf("OpenAI auth error: %v", msg.err)
 		} else {
@@ -171,6 +178,9 @@ func (m wizardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Reset()
 		m.current = nil
 		m.pendingAnthropic = nil
+		if m.manualProvider == "anthropic" {
+			m.manualProvider = ""
+		}
 		if msg.err != nil {
 			m.message = fmt.Sprintf("Anthropic auth failed: %v", msg.err)
 			return m, nil
@@ -197,7 +207,7 @@ func (m wizardModel) handleKey(msg tea.KeyMsg) (wizardModel, tea.Cmd) {
 			m.mode = modeList
 			m.input.Reset()
 			m.current = nil
-			m.pendingAnthropic = nil
+			m.manualProvider = ""
 			m.message = "Canceled input."
 			return m, nil
 		case "enter":
@@ -217,6 +227,10 @@ func (m wizardModel) handleKey(msg tea.KeyMsg) (wizardModel, tea.Cmd) {
 	case "down", "j":
 		if m.selected < len(m.cards)-1 {
 			m.selected++
+		}
+	case "c":
+		if provider := m.manualProviderForSelection(); provider != "" {
+			return m.startManualCallback(provider)
 		}
 	case "enter":
 		return m.activateCard()
@@ -262,7 +276,12 @@ func (m wizardModel) View() string {
 	} else {
 		b.WriteString(m.message)
 		b.WriteByte('\n')
-		b.WriteString("[enter] configure  [esc] exit  [↑/↓] navigate\n")
+		keys := "[enter] configure  [esc] exit  [↑/↓] navigate"
+		if m.manualProviderForSelection() != "" {
+			keys += "  [c] paste callback/code"
+		}
+		b.WriteString(keys)
+		b.WriteByte('\n')
 	}
 	return b.String()
 }
@@ -294,7 +313,14 @@ func (m wizardModel) startOpenAISubscription() (wizardModel, tea.Cmd) {
 		m.message = fmt.Sprintf("OpenAI auth init error: %v", err)
 		return m, nil
 	}
-	m.message = fmt.Sprintf("Opening OpenAI login. If your browser does not open automatically, visit:\n%s\nIf you're on a remote host, forward port 1455 first: ssh -L 1455:localhost:1455 user@server", session.URL)
+	m.pendingOpenAI = session
+	port := callbackPort(session.CallbackURL)
+	forward := forwardHint(port)
+	forwardLine := ""
+	if forward != "" {
+		forwardLine = forward + "\n"
+	}
+	m.message = fmt.Sprintf("Opening OpenAI login. If your browser does not open automatically, visit:\n%s\nCallback listening on %s.\n%sPress 'c' to paste the callback URL manually (use this anytime the Continue button won’t fire or the browser can’t reach pfui).", session.URL, session.CallbackURL, forwardLine)
 	return m, func() tea.Msg {
 		_ = authflow.AttemptBrowserOpen(session.URL)
 		note, err := session.Wait()
@@ -302,21 +328,29 @@ func (m wizardModel) startOpenAISubscription() (wizardModel, tea.Cmd) {
 	}
 }
 
-func (m wizardModel) startAnthropicSubscription(card *wizardCard) (wizardModel, tea.Cmd) {
-	auth, err := authflow.PrepareAnthropicFlow(authflow.AnthropicModeMax)
+func (m wizardModel) startAnthropicSubscription(_ *wizardCard) (wizardModel, tea.Cmd) {
+	session, err := authflow.StartAnthropicLoopbackFlow(m.ctx)
 	if err != nil {
 		m.message = fmt.Sprintf("Anthropic auth init error: %v", err)
 		return m, nil
 	}
-	m.mode = modeInput
-	m.current = card
-	m.pendingAnthropic = auth
-	m.input.Placeholder = "Paste the code#state shown in the browser"
-	m.input.SetValue("")
-	m.input.Focus()
-	m.message = fmt.Sprintf("Follow the Claude auth prompts, then paste the code. If your browser stays closed, open:\n%s", auth.URL)
-	_ = authflow.AttemptBrowserOpen(auth.URL)
-	return m, textinput.Blink
+	m.pendingAnthropic = session
+	port := callbackPort(session.CallbackURL)
+	forward := forwardHint(port)
+	forwardLine := ""
+	if forward != "" {
+		forwardLine = forward + "\n"
+	}
+	manualLine := ""
+	if strings.TrimSpace(session.ManualURL) != "" {
+		manualLine = fmt.Sprintf("If the Continue button stays disabled, open the manual fallback instead:\n%s\nThen paste the code#state snippet with 'c'.\n", session.ManualURL)
+	}
+	m.message = fmt.Sprintf("Opening Claude login (auto redirect). If your browser does not open automatically, visit:\n%s\nCallback listening on %s.\n%s%sPress 'c' to paste the callback URL or code when you're back in pfui.", session.URL, session.CallbackURL, forwardLine, manualLine)
+	return m, func() tea.Msg {
+		_ = authflow.AttemptBrowserOpen(session.URL)
+		result, err := session.Wait()
+		return anthropicAuthMsg{result: result, err: err}
+	}
 }
 
 func (m wizardModel) startAPIKeyEntry(card *wizardCard, placeholder string, provider string) (wizardModel, tea.Cmd) {
@@ -346,17 +380,37 @@ func (m wizardModel) saveInput() (wizardModel, tea.Cmd) {
 		m.message = "Input cannot be empty"
 		return m, nil
 	}
+	if m.manualProvider != "" {
+		var submitErr error
+		switch m.manualProvider {
+		case "openai":
+			if m.pendingOpenAI == nil {
+				submitErr = fmt.Errorf("OpenAI login is not active")
+			} else {
+				submitErr = m.pendingOpenAI.SubmitCallback(value)
+			}
+		case "anthropic":
+			if m.pendingAnthropic == nil {
+				submitErr = fmt.Errorf("Claude login is not active")
+			} else {
+				submitErr = m.pendingAnthropic.SubmitCallback(value)
+			}
+		default:
+			submitErr = fmt.Errorf("unknown manual provider")
+		}
+		if submitErr != nil {
+			m.message = fmt.Sprintf("Callback error: %v", submitErr)
+			return m, nil
+		}
+		m.manualProvider = ""
+		m.mode = modeList
+		m.input.Reset()
+		m.message = "Received callback. Completing login..."
+		return m, nil
+	}
 	if m.current == nil {
 		m.mode = modeList
 		return m, nil
-	}
-	if m.current.Kind == cardClaudeSubscription {
-		if m.pendingAnthropic == nil {
-			m.message = "Anthropic auth session expired. Re-open the card to restart."
-			return m, nil
-		}
-		m.message = "Exchanging Claude authorization code..."
-		return m, m.exchangeAnthropicCode(value)
 	}
 	if m.current.Kind == cardPlanSettings {
 		if err := m.applyPlanSetting(value); err != nil {
@@ -395,16 +449,81 @@ func (m wizardModel) saveInput() (wizardModel, tea.Cmd) {
 	return m, nil
 }
 
-func (m wizardModel) exchangeAnthropicCode(code string) tea.Cmd {
-	auth := m.pendingAnthropic
-	return func() tea.Msg {
-		result, err := authflow.CompleteAnthropicFlow(auth, code)
-		return anthropicAuthMsg{result: result, err: err}
+func (m wizardModel) startManualCallback(provider string) (wizardModel, tea.Cmd) {
+	var active bool
+	placeholder := "Paste the callback URL (?code=...&state=...)"
+	switch provider {
+	case "openai":
+		active = m.pendingOpenAI != nil
+		placeholder = "Paste the OpenAI callback URL (or ?code=...&state=... snippet)"
+	case "anthropic":
+		active = m.pendingAnthropic != nil
+		placeholder = "Paste the Claude callback URL or code#state snippet"
+	default:
+		active = false
 	}
+	if !active {
+		m.message = "No pending login to complete manually."
+		return m, nil
+	}
+	m.mode = modeInput
+	m.manualProvider = provider
+	m.current = nil
+	m.input.Placeholder = placeholder
+	m.input.SetValue("")
+	m.input.Focus()
+	if provider == "anthropic" {
+		m.message = "Paste the callback URL or Claude's code#state snippet, then press Enter."
+	} else {
+		m.message = "Paste the callback URL or code snippet from your browser and press Enter."
+	}
+	return m, textinput.Blink
 }
 
 func (m *wizardModel) markConfigured(kind cardKind) {
 	m.authStatus[kind] = true
+}
+
+func (m wizardModel) manualProviderForSelection() string {
+	if len(m.cards) == 0 || m.selected < 0 || m.selected >= len(m.cards) {
+		return ""
+	}
+	switch m.cards[m.selected].Kind {
+	case cardOpenAISubscription:
+		if m.pendingOpenAI != nil {
+			return "openai"
+		}
+	case cardClaudeSubscription:
+		if m.pendingAnthropic != nil {
+			return "anthropic"
+		}
+	}
+	return ""
+}
+
+func callbackPort(cb string) string {
+	u, err := url.Parse(cb)
+	if err != nil {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		return port
+	}
+	host := u.Host
+	if strings.Contains(host, ":") {
+		parts := strings.Split(host, ":")
+		if len(parts) == 2 {
+			return parts[1]
+		}
+	}
+	return ""
+}
+
+func forwardHint(port string) string {
+	if strings.TrimSpace(port) == "" {
+		return ""
+	}
+	return fmt.Sprintf("Forward %s if you're remote: ssh -L %s:localhost:%s user@server", port, port, port)
 }
 
 func (m wizardModel) planSummary() string {

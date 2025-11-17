@@ -56,7 +56,7 @@ func instantiateCustom(manifest provider.Manifest) provider.Provider {
 	}
 	switch manifest.Adapter {
 	case provider.AdapterOpenAIChat, provider.AdapterOpenAIResponses:
-		return openai.NewWithName(manifest.Host, manifest.Token, manifest.Name)
+		return openai.NewWithAdapter(manifest.Host, manifest.Token, manifest.Name, manifest.Adapter)
 	case provider.AdapterAnthropicMessage:
 		return anthropic.NewWithName(manifest.Host, manifest.Token, manifest.Name)
 	default:

@@ -32,22 +32,8 @@ const (
 	openAIUserAgent  = "pfui/0.1 (codex_cli_rs compatible)"
 )
 
-// BrowserSession represents a pending local callback flow.
-type BrowserSession struct {
-	URL  string
-	wait func() (string, error)
-}
-
-// Wait blocks until the browser flow completes.
-func (s *BrowserSession) Wait() (string, error) {
-	if s == nil || s.wait == nil {
-		return "", fmt.Errorf("invalid browser session")
-	}
-	return s.wait()
-}
-
 // StartOpenAICodexFlow launches a localhost callback server and builds the Codex-style OAuth URL.
-func StartOpenAICodexFlow(ctx context.Context) (*BrowserSession, error) {
+func StartOpenAICodexFlow(ctx context.Context) (*BrowserSession[string], error) {
 	clientID := os.Getenv("PFUI_OPENAI_CLIENT_ID")
 	if strings.TrimSpace(clientID) == "" {
 		clientID = openAIClientID
@@ -105,11 +91,11 @@ func StartOpenAICodexFlow(ctx context.Context) (*BrowserSession, error) {
 		}
 	}()
 
-	return &BrowserSession{
-		URL: authURL,
+	return &BrowserSession[string]{
+		URL:         authURL,
+		CallbackURL: redirectURL,
 		wait: func() (string, error) {
 			defer server.Shutdown(context.Background())
-			timeout := 2 * time.Minute
 			select {
 			case <-ctx.Done():
 				return "", ctx.Err()
@@ -118,8 +104,21 @@ func StartOpenAICodexFlow(ctx context.Context) (*BrowserSession, error) {
 			case code := <-codeCh:
 				note, err := completeOpenAIAuthorization(clientID, redirectURL, code, pkce)
 				return note, err
-			case <-time.After(timeout):
-				return "", fmt.Errorf("timed out waiting for OpenAI authorization")
+			}
+		},
+		submit: func(raw string) error {
+			code, providedState, _, err := parseCallbackInput(raw)
+			if err != nil {
+				return err
+			}
+			if providedState != state {
+				return fmt.Errorf("OpenAI state mismatch; restart the login flow")
+			}
+			select {
+			case codeCh <- code:
+				return nil
+			default:
+				return fmt.Errorf("OpenAI authorization already completed")
 			}
 		},
 	}, nil
@@ -255,7 +254,6 @@ func createOpenAIAPIKey(clientID, idToken string) (string, error) {
 	}
 	return resp.AccessToken, nil
 }
-
 
 func doFormRequest(endpoint string, form url.Values) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodPost, endpoint, strings.NewReader(form.Encode()))

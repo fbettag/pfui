@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -18,6 +19,7 @@ import (
 	"github.com/fbettag/pfui/internal/history"
 	"github.com/fbettag/pfui/internal/provider"
 	"github.com/fbettag/pfui/internal/toolexec"
+	"github.com/fbettag/pfui/internal/tui/compose"
 )
 
 // Options configure the interactive chat run.
@@ -47,11 +49,16 @@ var (
 			Foreground(lipgloss.Color("#000000")).
 			Bold(true).
 			Padding(0, 1)
+	userBlockStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("#2E323F")).
+			Foreground(lipgloss.Color("#E1E6F2"))
+	assistantBlockStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("#E6EDF7"))
 )
 
 // Run launches the chat interface in the foreground.
 func Run(ctx context.Context, cfg config.Config, opts Options) error {
-	m := newModel(cfg, opts)
+	m := newModel(ctx, cfg, opts)
 	p := tea.NewProgram(m, tea.WithContext(ctx))
 	finalModel, err := p.Run()
 	if fm, ok := finalModel.(model); ok && fm.session.ID != "" {
@@ -61,6 +68,7 @@ func Run(ctx context.Context, cfg config.Config, opts Options) error {
 }
 
 type model struct {
+	ctx              context.Context
 	cfg              config.Config
 	opts             Options
 	providers        provider.Registry
@@ -72,7 +80,7 @@ type model struct {
 	executor         *toolexec.Executor
 	jobs             map[string]toolexec.Job
 	messages         []string
-	input            textinput.Model
+	compose          compose.Model
 	width            int
 	height           int
 	session          history.Session
@@ -85,12 +93,17 @@ type model struct {
 	showPlan         bool
 	question         *questionPrompt
 	catalog          modelCatalog
+	spinner          spinner.Model
+	pendingResponse  *streamingResponse
+	responseStream   *responseStreamState
+	pendingCancel    context.CancelFunc
 }
 
-func newModel(cfg config.Config, opts Options) model {
-	input := textinput.New()
-	input.Placeholder = "Describe what you need..."
-	input.Focus()
+func newModel(ctx context.Context, cfg config.Config, opts Options) model {
+	composer := compose.New()
+	composer.SetPlaceholder("Describe what you need...")
+	composer.Focus()
+	composer.SetWidth(80)
 
 	lines := []string{
 		"pfui ready. Configuration mode keeps scrollback safe; run `/config` or `pfui --configuration` for the full-screen wizard.",
@@ -120,7 +133,10 @@ func newModel(cfg config.Config, opts Options) model {
 	header := historyBlockLines("pfui session", buildSessionHeaderLines(session, opts.ProjectPath, cfg.Plan, available, planModePlan))
 	lines = append(header, lines...)
 	executor := toolexec.NewExecutor()
-	return model{
+	spin := spinner.New()
+	spin.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("#C1C6D6"))
+	m := model{
+		ctx:              ctx,
 		cfg:              cfg,
 		opts:             opts,
 		providers:        opts.Providers,
@@ -132,7 +148,7 @@ func newModel(cfg config.Config, opts Options) model {
 		executor:         executor,
 		jobs:             make(map[string]toolexec.Job),
 		messages:         lines,
-		input:            input,
+		compose:          composer,
 		session:          session,
 		statusLine:       status,
 		plan:             planModePlan,
@@ -140,7 +156,11 @@ func newModel(cfg config.Config, opts Options) model {
 		catalog: modelCatalog{
 			loading: make(map[string]bool),
 		},
+		spinner: spin,
 	}
+	m.refreshComposeFooter()
+	m.refreshComposeStatus()
+	return m
 }
 
 type planStep struct {
@@ -166,6 +186,28 @@ type modelCatalogRow struct {
 	Provider   string
 	ModelName  string
 	Selectable bool
+}
+
+type blockRef struct {
+	start  int
+	length int
+}
+
+type streamingResponse struct {
+	title  string
+	style  lipgloss.Style
+	block  blockRef
+	buffer string
+}
+
+type responseStreamState struct {
+	stream <-chan provider.StreamChunk
+}
+
+type responseChunkMsg struct {
+	Text string
+	Err  error
+	Done bool
 }
 
 func initSession(opts Options) (history.Session, string) {
@@ -214,6 +256,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		if msg.Type == tea.KeyTab {
+			if m.tryTabComplete(true) {
+				return m, nil
+			}
+			m.cyclePlanMode()
+			return m, nil
+		}
+		if msg.Type == tea.KeyShiftTab {
+			if m.tryTabComplete(false) {
+				return m, nil
+			}
 			m.cyclePlanMode()
 			return m, nil
 		}
@@ -254,8 +306,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.statusLine = "Canceled foreground command."
 				return m, nil
 			}
-			m.input.Reset()
+			if m.pendingResponse != nil {
+				m.finishResponseStream()
+				m.messages = append(m.messages, "pfui: canceled response stream")
+				return m, nil
+			}
+			m.compose.Reset()
+			m.compose.Focus()
 			m.recallMode = false
+			m.refreshComposeStatus()
 			return m, nil
 		case "enter":
 			if handled, cmd := m.processCommandPaletteKey(msg); handled {
@@ -267,17 +326,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			if m.recallMode && msg.String() != "ctrl+r" {
 				m.recallMode = false
+				m.refreshComposeStatus()
 			}
 			if handled, cmd := m.processCommandPaletteKey(msg); handled {
 				return m, cmd
 			}
 			var cmd tea.Cmd
-			m.input, cmd = m.input.Update(msg)
+			m.compose, cmd = m.compose.Update(msg)
 			return m, cmd
 		}
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.compose.SetWidth(msg.Width)
+		return m, nil
+	case spinner.TickMsg:
+		if m.pendingResponse != nil {
+			var cmd tea.Cmd
+			m.spinner, cmd = m.spinner.Update(msg)
+			m.refreshComposeStatus()
+			return m, cmd
+		}
 		return m, nil
 	case execEventMsg:
 		if msg.job.ID != "" {
@@ -326,9 +395,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.ensureCatalogSelection()
 		}
 		return m, nil
+	case responseChunkMsg:
+		if m.pendingResponse == nil {
+			return m, nil
+		}
+		if msg.Err != nil {
+			m.messages = append(m.messages, fmt.Sprintf("pfui: %v", msg.Err))
+			m.finishResponseStream()
+			return m, nil
+		}
+		if msg.Text != "" {
+			m.pendingResponse.buffer += msg.Text
+			body := strings.Split(m.pendingResponse.buffer, "\n")
+			m.replaceHistoryBlock(&m.pendingResponse.block, m.pendingResponse.title, body, m.pendingResponse.style)
+		}
+		if msg.Done {
+			m.finishResponseStream()
+			return m, nil
+		}
+		return m, m.nextResponseChunkCmd()
 	default:
 		var cmd tea.Cmd
-		m.input, cmd = m.input.Update(msg)
+		m.compose, cmd = m.compose.Update(msg)
 		return m, cmd
 	}
 }
@@ -358,10 +446,12 @@ func (m model) View() string {
 		questionView = renderQuestionPrompt(m.question)
 		questionLines = countLines(questionView)
 	}
+	composeView := m.compose.View()
+	composeLines := countLines(composeView)
 	jobLine := summarizeJobs(m.jobs)
 	status := m.statusDisplay()
 	modeBadge := m.modeBadge()
-	dockHeight := 4 // separator + input + session info + hint line
+	dockHeight := 2 // separator + hint line
 	if status != "" {
 		dockHeight++
 	}
@@ -371,7 +461,7 @@ func (m model) View() string {
 	if jobLine != "" {
 		dockHeight++
 	}
-	dockHeight += paletteLines + catalogLines + planLines + questionLines
+	dockHeight += paletteLines + catalogLines + planLines + questionLines + composeLines
 	viewportHeight := m.height - dockHeight
 	if viewportHeight < 3 {
 		viewportHeight = 3
@@ -401,14 +491,9 @@ func (m model) View() string {
 	if planView != "" {
 		builder.WriteString(planView)
 	}
-	builder.WriteString(m.input.View())
-	builder.WriteByte('\n')
-	sessionInfo := fmt.Sprintf("session: %s  project: %s", safeString(m.session.ID), safeString(m.session.Project))
-	builder.WriteString(sessionInfo)
-	if m.recallMode {
-		builder.WriteString("  reverse-search ↑")
+	if composeView != "" {
+		builder.WriteString(composeView)
 	}
-	builder.WriteByte('\n')
 	if questionView != "" {
 		builder.WriteString(questionView)
 		builder.WriteByte('\n')
@@ -430,12 +515,13 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 		}
 		m.messages = append(m.messages, fmt.Sprintf("[answer] %s", answer))
 		m.question = nil
-		m.input.Reset()
-		m.input.Focus()
+		m.compose.Reset()
+		m.compose.Focus()
+		m.refreshComposeStatus()
 		return m, nil
 	}
-	text := strings.TrimSpace(m.input.Value())
-	m.input.Reset()
+	text := strings.TrimSpace(m.compose.Value())
+	m.compose.Reset()
 	if text == "" {
 		return m, nil
 	}
@@ -447,6 +533,7 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 	}
 	if m.activeProvider == nil {
 		if m.trySelectProvider(text) {
+			m.refreshComposeFooter()
 			return m, nil
 		}
 		m.messages = append(m.messages, providerPromptText(m.available))
@@ -454,11 +541,8 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 	}
 	m.promptHistory = append(m.promptHistory, text)
 	m.recallMode = false
-	m.appendHistoryBlock(fmt.Sprintf("you (%s)", providerLabel(m.activeProvider)), []string{text})
-	m.appendHistoryBlock(
-		fmt.Sprintf("pfui (%s/%s)", providerLabel(m.activeProvider), defaultModelDisplay(m.defaultModel)),
-		[]string{fmt.Sprintf("placeholder response (models whitelist entries: %d)", len(m.providerWhitelist(m.activeProvider)))},
-	)
+	m.refreshComposeStatus()
+	m.appendStyledHistoryBlock(fmt.Sprintf("you (%s)", providerLabel(m.activeProvider)), []string{text}, userBlockStyle)
 	if m.session.ID != "" {
 		if m.session.Title == "New chat" {
 			m.session.Title = truncate(text, 60)
@@ -470,7 +554,7 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 			m.statusLine = fmt.Sprintf("Updated %s at %s", m.session.ID, time.Now().Format(time.Kitchen))
 		}
 	}
-	return m, nil
+	return m, m.beginResponseStream(text)
 }
 
 func (m model) handleReverseSearch() (tea.Model, tea.Cmd) {
@@ -480,11 +564,12 @@ func (m model) handleReverseSearch() (tea.Model, tea.Cmd) {
 	if !m.recallMode {
 		m.recallMode = true
 		m.recallPosition = len(m.promptHistory)
+		m.refreshComposeStatus()
 	}
 	if m.recallPosition > 0 {
 		m.recallPosition--
-		m.input.SetValue(m.promptHistory[m.recallPosition])
-		m.input.CursorEnd()
+		m.compose.SetValue(m.promptHistory[m.recallPosition])
+		m.compose.CursorEnd()
 	}
 	return m, nil
 }
@@ -545,8 +630,8 @@ func (m *model) processCommandPaletteKey(msg tea.KeyMsg) (bool, tea.Cmd) {
 	}
 	if m.commandPalette.SelectedCommand != "" && !m.commandPalette.visible {
 		selection := m.commandPalette.SelectedCommand
-		m.input.SetValue(selection + " ")
-		m.input.CursorEnd()
+		m.compose.SetValue(selection + " ")
+		m.compose.CursorEnd()
 		m.commandPalette.Reset()
 		handled = true
 	}
@@ -638,6 +723,7 @@ func (m *model) activateSelectedCatalogModel() bool {
 	m.messages = append(m.messages, message)
 	m.statusLine = message
 	m.catalog.visible = false
+	m.refreshComposeFooter()
 	return true
 }
 
@@ -679,6 +765,7 @@ func (m *model) trySelectProvider(input string) bool {
 			message := fmt.Sprintf("Using %s via %s", defaultModelDisplay(m.defaultModel), p.Name())
 			m.messages = append(m.messages, message)
 			m.statusLine = message
+			m.refreshComposeFooter()
 			return true
 		}
 	}
@@ -824,7 +911,46 @@ func safeString(s string) string {
 }
 
 func (m *model) appendHistoryBlock(title string, body []string) {
-	m.messages = append(m.messages, historyBlockLines(title, body)...)
+	m.appendStyledHistoryBlock(title, body, lipgloss.NewStyle())
+}
+
+func (m *model) appendStyledHistoryBlock(title string, body []string, style lipgloss.Style) {
+	m.appendStyledHistoryBlockRef(title, body, style)
+}
+
+func (m *model) appendStyledHistoryBlockRef(title string, body []string, style lipgloss.Style) blockRef {
+	lines := historyBlockLines(title, body)
+	for i, line := range lines {
+		lines[i] = style.Render(line)
+	}
+	start := len(m.messages)
+	m.messages = append(m.messages, lines...)
+	return blockRef{start: start, length: len(lines)}
+}
+
+func (m *model) replaceHistoryBlock(ref *blockRef, title string, body []string, style lipgloss.Style) {
+	if ref == nil {
+		return
+	}
+	lines := historyBlockLines(title, body)
+	for i, line := range lines {
+		lines[i] = style.Render(line)
+	}
+	start := ref.start
+	end := start + ref.length
+	if start > len(m.messages) {
+		start = len(m.messages)
+	}
+	if end > len(m.messages) {
+		end = len(m.messages)
+	}
+	updated := make([]string, 0, len(m.messages)-(end-start)+len(lines))
+	updated = append(updated, m.messages[:start]...)
+	updated = append(updated, lines...)
+	updated = append(updated, m.messages[end:]...)
+	m.messages = updated
+	ref.length = len(lines)
+	ref.start = start
 }
 
 func historyBlockLines(title string, body []string) []string {
@@ -865,18 +991,7 @@ func buildSessionHeaderLines(session history.Session, projectPath string, planCf
 		}
 		providerLine = fmt.Sprintf("providers: %s", strings.Join(names, ", "))
 	}
-	planSummary := "memory only"
-	if strings.EqualFold(planCfg.Storage, "file") {
-		path := strings.TrimSpace(planCfg.FilePath)
-		if path == "" {
-			path = "PLAN.md"
-		}
-		modeLabel := "manual"
-		if planCfg.AutoWrite {
-			modeLabel = "auto"
-		}
-		planSummary = fmt.Sprintf("file → %s (%s)", path, modeLabel)
-	}
+	planSummary := planStorageSummary(planCfg)
 	return []string{
 		providerLine,
 		fmt.Sprintf("project: %s", safeString(project)),
@@ -884,6 +999,78 @@ func buildSessionHeaderLines(session history.Session, projectPath string, planCf
 		fmt.Sprintf("plan storage: %s", planSummary),
 		"commands: /plan /model /jobs /help",
 	}
+}
+
+func planStorageSummary(planCfg config.PlanConfig) string {
+	if !strings.EqualFold(planCfg.Storage, "file") {
+		return "memory only"
+	}
+	path := strings.TrimSpace(planCfg.FilePath)
+	if path == "" {
+		path = "PLAN.md"
+	}
+	policy := "manual"
+	if planCfg.AutoWrite {
+		policy = "auto"
+	}
+	return fmt.Sprintf("file → %s (%s)", path, policy)
+}
+
+func (m *model) beginResponseStream(prompt string) tea.Cmd {
+	if m.activeProvider == nil {
+		return nil
+	}
+	if m.pendingResponse != nil {
+		m.finishResponseStream()
+	}
+	title := fmt.Sprintf("pfui (%s/%s)", providerLabel(m.activeProvider), defaultModelDisplay(m.defaultModel))
+	ref := m.appendStyledHistoryBlockRef(title, []string{"…"}, assistantBlockStyle)
+	m.pendingResponse = &streamingResponse{title: title, style: assistantBlockStyle, block: ref}
+
+	req := provider.ChatCompletionRequest{
+		Model:    m.defaultModel,
+		Messages: []provider.ChatMessage{{Role: "user", Content: prompt}},
+	}
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.pendingCancel = cancel
+	stream, err := m.activeProvider.StreamChat(ctx, req)
+	if err != nil {
+		m.finishResponseStream()
+		m.messages = append(m.messages, fmt.Sprintf("pfui: %v", err))
+		return nil
+	}
+	m.responseStream = &responseStreamState{stream: stream}
+	m.refreshComposeStatus()
+	cmd := m.nextResponseChunkCmd()
+	if cmd == nil {
+		m.finishResponseStream()
+		return nil
+	}
+	return tea.Batch(cmd, m.spinner.Tick)
+}
+
+func (m *model) nextResponseChunkCmd() tea.Cmd {
+	if m.responseStream == nil {
+		return nil
+	}
+	stream := m.responseStream.stream
+	return func() tea.Msg {
+		chunk, ok := <-stream
+		if !ok {
+			return responseChunkMsg{Done: true}
+		}
+		return responseChunkMsg{Text: chunk.Content, Err: chunk.Err, Done: chunk.Done}
+	}
+}
+
+func (m *model) finishResponseStream() {
+	if m.pendingCancel != nil {
+		m.pendingCancel()
+		m.pendingCancel = nil
+	}
+	m.pendingResponse = nil
+	m.responseStream = nil
+	m.refreshComposeStatus()
 }
 
 func summarizeJobs(jobs map[string]toolexec.Job) string {
@@ -951,6 +1138,7 @@ func (m *model) setPlanMode(mode planMode) {
 	m.plan = mode
 	m.statusLine = fmt.Sprintf("Switched to %s mode", strings.ToUpper(string(mode)))
 	m.messages = append(m.messages, fmt.Sprintf("pfui: switched to %s mode", strings.ToUpper(string(mode))))
+	m.refreshComposeFooter()
 }
 
 func (m *model) cyclePlanMode() {
@@ -978,6 +1166,41 @@ func (m *model) recordJobEvent(job toolexec.Job) {
 		}
 		m.messages = append(m.messages, msg)
 	}
+}
+
+func (m *model) refreshComposeFooter() {
+	project := strings.TrimSpace(m.session.Project)
+	if project == "" {
+		project = strings.TrimSpace(m.opts.ProjectPath)
+	}
+	var parts []string
+	if project != "" {
+		parts = append(parts, fmt.Sprintf("project %s", project))
+	}
+	if m.activeProvider != nil {
+		parts = append(parts, fmt.Sprintf("provider %s (%s)", m.activeProvider.Name(), defaultModelDisplay(m.defaultModel)))
+	} else if len(m.available) > 0 {
+		parts = append(parts, "provider select with /provider")
+	} else {
+		parts = append(parts, "provider none configured")
+	}
+	parts = append(parts, fmt.Sprintf("plan %s", strings.ToUpper(string(m.plan))))
+	parts = append(parts, fmt.Sprintf("plan storage %s", planStorageSummary(m.cfg.Plan)))
+	if len(parts) == 0 {
+		m.compose.SetInfoLine("")
+		return
+	}
+	m.compose.SetInfoLine(strings.Join(parts, " · "))
+}
+
+func (m *model) refreshComposeStatus() {
+	status := "esc to cancel · ctrl+r history"
+	if m.recallMode {
+		status = "reverse search ↑/↓ · enter to run"
+	} else if m.pendingResponse != nil {
+		status = fmt.Sprintf("%s generating… · esc to cancel", m.spinner.View())
+	}
+	m.compose.SetStatus(status, "? for shortcuts")
 }
 
 func shortJobID(id string) string {
@@ -1018,6 +1241,37 @@ func renderModelCatalog(c modelCatalog) string {
 	}
 	b.WriteString("  [↑/↓] move  [enter] select  [esc] close /model drawer\n")
 	return b.String()
+}
+
+func (m *model) tryTabComplete(forward bool) bool {
+	value := m.compose.Value()
+	trimmed := strings.TrimLeft(value, " \t")
+	if !strings.HasPrefix(trimmed, "/") {
+		return false
+	}
+	leftPad := value[:len(value)-len(trimmed)]
+	cmdEnd := strings.IndexAny(trimmed, " \t\r\n")
+	command := trimmed
+	suffix := ""
+	if cmdEnd >= 0 {
+		command = trimmed[:cmdEnd]
+		suffix = trimmed[cmdEnd:]
+	}
+	if command == "" {
+		return false
+	}
+	m.commandPalette.setFilter(command)
+	delta := 1
+	if !forward {
+		delta = -1
+	}
+	match := m.commandPalette.cycleSelection(delta)
+	if match == "" {
+		return true
+	}
+	m.compose.SetValue(leftPad + match + suffix)
+	m.compose.CursorEnd()
+	return true
 }
 
 func printResumeHint(sessionID, launchArgs string) {
@@ -1255,6 +1509,8 @@ func (m model) updateQuestion(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.Type == tea.KeyEsc {
 		m.question = nil
 		m.messages = append(m.messages, "pfui: dismissed question")
+		m.compose.Focus()
+		m.refreshComposeStatus()
 		return m, nil
 	}
 	if msg.Type == tea.KeyEnter {

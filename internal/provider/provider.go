@@ -22,6 +22,25 @@ type Model struct {
 	Tags         map[string]string
 }
 
+// ChatMessage models a basic role/content pair.
+type ChatMessage struct {
+	Role    string
+	Content string
+}
+
+// ChatCompletionRequest describes a streaming completion.
+type ChatCompletionRequest struct {
+	Model    string
+	Messages []ChatMessage
+}
+
+// StreamChunk is emitted while a provider streams a response.
+type StreamChunk struct {
+	Content string
+	Err     error
+	Done    bool
+}
+
 // StartChatOptions configure new sessions.
 type StartChatOptions struct {
 	SessionID string
@@ -40,6 +59,7 @@ type Provider interface {
 	Kind() Kind
 	ListModels(ctx context.Context) ([]Model, error)
 	StartChat(ctx context.Context, opts StartChatOptions) (Session, error)
+	StreamChat(ctx context.Context, req ChatCompletionRequest) (<-chan StreamChunk, error)
 }
 
 // Registry stores available providers (built-in + custom).

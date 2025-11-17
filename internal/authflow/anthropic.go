@@ -2,16 +2,20 @@ package authflow
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/fbettag/pfui/internal/authflow/successpage"
 	"github.com/fbettag/pfui/internal/authstore"
+	"github.com/google/uuid"
 )
 
 const (
@@ -32,20 +36,31 @@ const (
 
 // AnthropicAuthorize describes the prepared OAuth request.
 type AnthropicAuthorize struct {
-	URL      string
-	Verifier string
-	Mode     AnthropicMode
+	URL         string
+	Verifier    string
+	State       string
+	Mode        AnthropicMode
+	RedirectURL string
 }
 
 // PrepareAnthropicFlow builds the authorization URL for the selected mode.
-func PrepareAnthropicFlow(mode AnthropicMode) (*AnthropicAuthorize, error) {
-	clientID := os.Getenv("PFUI_ANTHROPIC_CLIENT_ID")
-	if strings.TrimSpace(clientID) == "" {
-		clientID = anthropicClientID
-	}
+func PrepareAnthropicFlow(mode AnthropicMode, redirectOverride ...string) (*AnthropicAuthorize, error) {
 	pkce, err := generatePKCE()
 	if err != nil {
 		return nil, err
+	}
+	state := uuid.New().String()
+	redirect := anthropicRedirect
+	if len(redirectOverride) > 0 && strings.TrimSpace(redirectOverride[0]) != "" {
+		redirect = redirectOverride[0]
+	}
+	return buildAnthropicAuthorize(mode, redirect, state, pkce)
+}
+
+func buildAnthropicAuthorize(mode AnthropicMode, redirect string, state string, pkce pkceCodes) (*AnthropicAuthorize, error) {
+	clientID := os.Getenv("PFUI_ANTHROPIC_CLIENT_ID")
+	if strings.TrimSpace(clientID) == "" {
+		clientID = anthropicClientID
 	}
 	host := "claude.ai"
 	if mode == AnthropicModeConsole {
@@ -59,14 +74,20 @@ func PrepareAnthropicFlow(mode AnthropicMode) (*AnthropicAuthorize, error) {
 	q.Set("code", "true")
 	q.Set("client_id", clientID)
 	q.Set("response_type", "code")
-	q.Set("redirect_uri", anthropicRedirect)
+	q.Set("redirect_uri", redirect)
 	q.Set("scope", anthropicScope)
 	q.Set("code_challenge", pkce.Challenge)
 	q.Set("code_challenge_method", "S256")
-	q.Set("state", pkce.Verifier)
+	q.Set("state", state)
 	authURL.RawQuery = q.Encode()
 
-	return &AnthropicAuthorize{URL: authURL.String(), Verifier: pkce.Verifier, Mode: mode}, nil
+	return &AnthropicAuthorize{
+		URL:         authURL.String(),
+		Verifier:    pkce.Verifier,
+		State:       state,
+		Mode:        mode,
+		RedirectURL: redirect,
+	}, nil
 }
 
 // AnthropicResult captures the output of exchanging a code.
@@ -90,7 +111,7 @@ func CompleteAnthropicFlow(auth *AnthropicAuthorize, codeInput string) (Anthropi
 	if len(parts) != 2 {
 		return AnthropicResult{}, fmt.Errorf("expected code of the form code#state")
 	}
-	if parts[1] != auth.Verifier {
+	if parts[1] != auth.State {
 		return AnthropicResult{}, fmt.Errorf("anthropic state mismatch; restart the login flow")
 	}
 	payload := map[string]string{
@@ -98,7 +119,7 @@ func CompleteAnthropicFlow(auth *AnthropicAuthorize, codeInput string) (Anthropi
 		"state":         parts[1],
 		"grant_type":    "authorization_code",
 		"client_id":     clientID,
-		"redirect_uri":  anthropicRedirect,
+		"redirect_uri":  auth.RedirectURL,
 		"code_verifier": auth.Verifier,
 	}
 	body, _ := json.Marshal(payload)
@@ -140,6 +161,107 @@ func CompleteAnthropicFlow(auth *AnthropicAuthorize, codeInput string) (Anthropi
 	default:
 		return AnthropicResult{}, fmt.Errorf("unsupported anthropic mode")
 	}
+}
+
+// StartAnthropicLoopbackFlow mirrors Claude Code's local OAuth callback.
+func StartAnthropicLoopbackFlow(ctx context.Context) (*BrowserSession[AnthropicResult], error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("creating anthropic callback listener: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	autoRedirect := fmt.Sprintf("http://localhost:%d/callback", port)
+	pkce, err := generatePKCE()
+	if err != nil {
+		listener.Close()
+		return nil, err
+	}
+	state := uuid.New().String()
+	manualAuth, err := buildAnthropicAuthorize(AnthropicModeMax, anthropicRedirect, state, pkce)
+	if err != nil {
+		listener.Close()
+		return nil, err
+	}
+	autoAuth, err := buildAnthropicAuthorize(AnthropicModeMax, autoRedirect, state, pkce)
+	if err != nil {
+		listener.Close()
+		return nil, err
+	}
+	type anthropicCallback struct {
+		code   string
+		manual bool
+	}
+	codeCh := make(chan anthropicCallback, 1)
+	errCh := make(chan error, 1)
+
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path != "/callback" && r.URL.Path != "/anthropic/callback" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if r.URL.Query().Get("state") != autoAuth.State {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, "State mismatch")
+				return
+			}
+			code := r.URL.Query().Get("code")
+			if code == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				fmt.Fprint(w, "Missing code parameter")
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			fmt.Fprint(w, successpage.HTML())
+			select {
+			case codeCh <- anthropicCallback{code: code, manual: false}:
+			default:
+			}
+		}),
+	}
+
+	go func() {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
+
+	return &BrowserSession[AnthropicResult]{
+		URL:         autoAuth.URL,
+		ManualURL:   manualAuth.URL,
+		CallbackURL: autoRedirect,
+		wait: func() (AnthropicResult, error) {
+			defer server.Shutdown(context.Background())
+			select {
+			case <-ctx.Done():
+				return AnthropicResult{}, ctx.Err()
+			case err := <-errCh:
+				return AnthropicResult{}, err
+			case cb := <-codeCh:
+				auth := autoAuth
+				if cb.manual {
+					auth = manualAuth
+				}
+				return CompleteAnthropicFlow(auth, fmt.Sprintf("%s#%s", cb.code, auth.State))
+			}
+		},
+		submit: func(raw string) error {
+			code, providedState, host, err := parseCallbackInput(raw)
+			if err != nil {
+				return err
+			}
+			if providedState != autoAuth.State {
+				return fmt.Errorf("Claude state mismatch; restart the login flow")
+			}
+			manual := isManualCallbackHost(host)
+			select {
+			case codeCh <- anthropicCallback{code: code, manual: manual}:
+				return nil
+			default:
+				return fmt.Errorf("Claude authorization already completed")
+			}
+		},
+	}, nil
 }
 
 func createAnthropicAPIKey(access string) (string, error) {
@@ -228,4 +350,15 @@ func RefreshAnthropicTokens(existing authstore.OAuthTokens) (authstore.OAuthToke
 		ExpiresAt:    expires,
 		Extra:        existing.Extra,
 	}, nil
+}
+
+func isManualCallbackHost(host string) bool {
+	host = strings.TrimSpace(strings.ToLower(host))
+	if host == "" {
+		return true
+	}
+	if host == "localhost" || host == "127.0.0.1" {
+		return false
+	}
+	return true
 }
